@@ -3,8 +3,8 @@ package main
 import (
 	"fmt"
 	"net/http"
-	"os"
 	"net/url"
+	"os"
 
 	"github.com/go-kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
@@ -38,19 +38,9 @@ func main() {
 	}
 
 	exporter := exp.NewExporter(dsn, exp.Namespace)
-	defer func() {
-		exporter.DB.Close()
-	}()
+	defer exporter.Close()
 	prometheus.MustRegister(exporter)
 
-	// Retrieve Pgpool-II version
-	v, err := exp.QueryVersion(exporter.DB)
-	if err != nil {
-		level.Error(exp.Logger).Log("err", err)
-	}
-	exp.PgpoolSemver = v
-
-	level.Info(exp.Logger).Log("msg", "Starting pgpool2_exporter", "version", version.Info(), "dsn", exp.MaskPassword(dsn))
 	level.Info(exp.Logger).Log("msg", "Listening on address", "address", *exp.ListenAddress)
 
 	http.Handle(*exp.MetricsPath, promhttp.Handler())
@@ -59,7 +49,7 @@ func main() {
 	})
 
 	if err := http.ListenAndServe(*exp.ListenAddress, nil); err != nil {
-		level.Error(exp.Logger).Log("err", err)
+		level.Error(exp.Logger).Log("msg", "HTTP server listen failed", "err", err)
 		os.Exit(1)
 	}
 }

@@ -28,7 +28,6 @@ import (
 	"fmt"
 	"math"
 	"net/url"
-	"os"
 	"regexp"
 	"strconv"
 	"sync"
@@ -150,13 +149,13 @@ type ColumnMapping struct {
 type Exporter struct {
 	dsn          string
 	namespace    string
-	mutex        sync.RWMutex
+	mutex        sync.Mutex
 	duration     prometheus.Gauge
 	up           prometheus.Gauge
 	error        prometheus.Gauge
 	totalScrapes prometheus.Counter
 	metricMap    map[string]MetricMapNamespace
-	DB           *sql.DB
+	db           *sql.DB
 }
 
 var (
@@ -221,17 +220,8 @@ var (
 // Pgpool-II version
 var pgpoolVersionRegex = regexp.MustCompile(`^((\d+)(\.\d+)(\.\d+)?)`)
 var version42 = semver.MustParse("4.2.0")
-var PgpoolSemver semver.Version
 
 func NewExporter(dsn string, namespace string) *Exporter {
-
-	db, err := getDBConn(dsn)
-
-	if err != nil {
-		level.Error(Logger).Log("err", err)
-		os.Exit(1)
-	}
-
 	return &Exporter{
 		dsn:       dsn,
 		namespace: namespace,
@@ -259,7 +249,6 @@ func NewExporter(dsn string, namespace string) *Exporter {
 			Help:      "Whether the last scrape of metrics from Pgpool-II resulted in an error (1 for error, 0 for success).",
 		}),
 		metricMap: makeDescMap(metricMaps, namespace),
-		DB:        db,
 	}
 }
 
@@ -541,7 +530,6 @@ func getDBConn(dsn string) (*sql.DB, error) {
 
 // Connect to Pgpool-II and run "SHOW POOL_VERSION;" to check connection availability.
 func ping(db *sql.DB) error {
-
 	rows, err := db.Query("SHOW POOL_VERSION;")
 	if err != nil {
 		return fmt.Errorf("error connecting to Pgpool-II: %s", err)
@@ -686,11 +674,15 @@ func QueryVersion(db *sql.DB) (semver.Version, error) {
 func queryNamespaceMappings(ch chan<- prometheus.Metric, db *sql.DB, metricMap map[string]MetricMapNamespace) map[string]error {
 	// Return a map of namespace -> errors
 	namespaceErrors := make(map[string]error)
+	ver, err := QueryVersion(db)
+	if err != nil {
+		level.Error(Logger).Log("msg", "Error querying version", "err", err)
+	}
 
 	for namespace, mapping := range metricMap {
 		// pool_backend_stats and pool_health_check_stats can not be used before 4.1.
 		if namespace == "pool_backend_stats" || namespace == "pool_health_check_stats" {
-			if PgpoolSemver.LT(version42) {
+			if ver.LT(version42) {
 				continue
 			}
 		}
@@ -711,6 +703,19 @@ func queryNamespaceMappings(ch chan<- prometheus.Metric, db *sql.DB, metricMap m
 	}
 
 	return namespaceErrors
+}
+
+func (e *Exporter) Close() {
+	e.mutex.Lock()
+	defer e.mutex.Unlock()
+
+	if db := e.db; db != nil {
+		e.db = nil
+
+		if err := db.Close(); err != nil {
+			level.Error(Logger).Log("msg", "Error closing Pgpool-II connection", "err", err)
+		}
+	}
 }
 
 // Describe implements prometheus.Collector.
@@ -751,6 +756,9 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 }
 
 func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
+	e.mutex.Lock()
+	defer e.mutex.Unlock()
+
 	e.totalScrapes.Inc()
 	var err error
 	defer func(begun time.Time) {
@@ -762,34 +770,36 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 		}
 	}(time.Now())
 
-	// Check connection availability and close the connection if it fails.
-	if err = ping(e.DB); err != nil {
-		level.Error(Logger).Log("msg", "Error pinging Pgpool-II", "err", err)
-		if cerr := e.DB.Close(); cerr != nil {
-			level.Error(Logger).Log("msg", "Error while closing non-pinging connection", "err", err)
-		}
-		level.Info(Logger).Log("msg", "Reconnecting to Pgpool-II")
-		e.DB, err = sql.Open("postgres", e.dsn)
-		e.DB.SetMaxOpenConns(1)
-		e.DB.SetMaxIdleConns(1)
-
-		if err = ping(e.DB); err != nil {
-			level.Error(Logger).Log("msg", "Error pinging Pgpool-II", "err", err)
-			if cerr := e.DB.Close(); cerr != nil {
-				level.Error(Logger).Log("msg", "Error while closing non-pinging connection", "err", err)
-			}
+	// Try to connect to DB if connection is not established yet.
+	if e.db == nil {
+		maskedDSN := MaskPassword(e.dsn)
+		e.db, err = getDBConn(e.dsn)
+		if err != nil {
+			level.Error(Logger).Log("msg", "Error connecting to Pgpool-II", "err", err, "dsn", maskedDSN)
 			e.up.Set(0)
 			return
 		}
+
+		level.Info(Logger).Log("msg", "Connected to Pgpool-II", "dsn", maskedDSN)
+	}
+
+	// Check connection availability and close the connection if it fails.
+	if err = ping(e.db); err != nil {
+		level.Error(Logger).Log("msg", "Error pinging Pgpool-II", "err", err)
+		if cerr := e.db.Close(); cerr != nil {
+			level.Error(Logger).Log("msg", "Error while closing non-pinging connection", "err", err)
+		}
+
+		// Retry connecting next time.
+		e.db = nil
+		e.up.Set(0)
+		return
 	}
 
 	e.up.Set(1)
 	e.error.Set(0)
 
-	e.mutex.RLock()
-	defer e.mutex.RUnlock()
-
-	errMap := queryNamespaceMappings(ch, e.DB, e.metricMap)
+	errMap := queryNamespaceMappings(ch, e.db, e.metricMap)
 	if len(errMap) > 0 {
 		level.Error(Logger).Log("err", errMap)
 		e.error.Set(1)
